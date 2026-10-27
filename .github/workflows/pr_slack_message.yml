@@ -1,0 +1,90 @@
+name: Post PR status to Slack
+
+# Called from a workflow triggered by pull_request and pull_request_review; see the README.
+on:
+  workflow_call:
+    secrets:
+      slack-token:
+        required: true
+
+jobs:
+  slack_message:
+    if: github.event_name == 'pull_request' || github.event.review.state != 'commented'
+    runs-on: ubuntu-26.04
+
+    # Serialized per PR, so two events arriving together can't both find no message and post twice.
+    # Each run reads the PR's current state, so a pending run replaced by a newer one loses nothing.
+    concurrency:
+      group: pr-slack-message-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Post, update or delete the PR message
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SLACK_API_TOKEN: ${{ secrets.slack-token }}
+          CHANNEL: C0CCF66U20J # #pull-requests
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          # Slack answers a rejected call with a 200 whose body says so.
+          slack() {
+            local method="$1" args=() response
+            shift
+            for param in "$@"; do args+=(--data-urlencode "$param"); done
+            response="$(curl --silent --show-error --fail \
+              --header "Authorization: Bearer $SLACK_API_TOKEN" \
+              "${args[@]}" "https://slack.com/api/$method")"
+            if [ "$(jq -r .ok <<<"$response")" != "true" ]; then
+              echo "Slack rejected $method: $response" >&2
+              return 1
+            fi
+            printf "%s" "$response"
+          }
+
+          pr="$(gh api graphql -F number="$PR_NUMBER" -f owner="${GITHUB_REPOSITORY%/*}" -f name="${GITHUB_REPOSITORY#*/}" -f query='
+            query($owner: String!, $name: String!, $number: Int!) {
+              repository(owner: $owner, name: $name) {
+                pullRequest(number: $number) { url title state isDraft reviewDecision createdAt author { login } }
+              }
+            }' --jq .data.repository.pullRequest)"
+          field() { jq -r ".$1 // empty" <<<"$pr"; }
+
+          # ponytail: nothing stores the message ts; it is found by the PR link among this bot's
+          # messages posted since the PR was opened, which can't predate it.
+          bot_id="$(slack auth.test | jq -r .bot_id)"
+          oldest="$(date -d "$(field createdAt)" +%s)"
+          ts=""
+          cursor=""
+          while :; do
+            page="$(slack conversations.history channel="$CHANNEL" oldest="$oldest" limit=200 cursor="$cursor")"
+            ts="$(jq -r --arg link "<$(field url)|" --arg bot "$bot_id" \
+              '[.messages[] | select(.bot_id == $bot and ((.text // "") | contains($link))) | .ts][0] // empty' <<<"$page")"
+            cursor="$(jq -r '.response_metadata.next_cursor // empty' <<<"$page")"
+            if [ -n "$ts" ] || [ -z "$cursor" ]; then break; fi
+          done
+
+          if [ "$(field state)" != "OPEN" ]; then
+            if [ -n "$ts" ]; then slack chat.delete channel="$CHANNEL" ts="$ts" >/dev/null; fi
+            exit 0
+          fi
+
+          if [ "$(field isDraft)" = "true" ]; then
+            status=":construction: *Draft*"
+          else
+            case "$(field reviewDecision)" in
+              APPROVED) status=":white_check_mark: *Approved*" ;;
+              CHANGES_REQUESTED) status=":warning: *Changes requested*" ;;
+              *) status=":eyes: *Ready for review*" ;;
+            esac
+          fi
+
+          title="$(field title | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')"
+          text="$status · <$(field url)|#$PR_NUMBER $title> by $(field author.login)"
+
+          if [ -n "$ts" ]; then
+            slack chat.update channel="$CHANNEL" ts="$ts" text="$text" >/dev/null
+          else
+            slack chat.postMessage channel="$CHANNEL" text="$text" unfurl_links=false >/dev/null
+          fi
